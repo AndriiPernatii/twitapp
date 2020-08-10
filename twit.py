@@ -4,6 +4,11 @@ errored_users = []
 
 TAGS_BY_USER = {"#dogs": 500}
 
+FOLLOWERS_CONNECTIONS = 15 #per 15 minutes
+TWIT_TAGS_CONNECTIONS = 75 #per 15 minutes
+#API endpoints to be used in GET requests
+API_PATH = 'https://api.twitter.com/1.1/followers/ids.json'
+LIKES_PATH = 'https://api.twitter.com/1.1/favorites/list.json'
 
 def auth(name, password):
     """ Authorization """
@@ -30,10 +35,8 @@ def cache(func):
 def get_target_subscribers(target_screen_name):
     """ Get a list of subscriber ids for the target account """
 
-    api_path = 'https://api.twitter.com/1.1/followers/ids.json'
     payload = {'screen_name' : target_screen_name}
-
-    request = requests.get(api_path , params=payload)
+    request = requests.get(API_PATH , params=payload)
     followers = request.json()
 
     followers_ids = followers['ids']
@@ -43,7 +46,7 @@ def get_target_subscribers(target_screen_name):
     #implementing the whole function in the while-loop
     while next_cursor != 0:
         payload = {'screen_name' : target_screen_name, 'cursor' = next_cursor}
-        request = requests.get(api_path , params=payload)
+        request = requests.get(API_PATH , params=payload)
         # todo: check status code for request limits
         followers = request.json()
         followers_ids.extend(followers['ids'])
@@ -51,22 +54,33 @@ def get_target_subscribers(target_screen_name):
 
     return followers_ids
 
+def get_next(queue):
+    try:
+        id = work_queue.get()
+        work_queue.task_done()
+    except:
+        logging.info("Could not retrieve an id from the working queue")
+    return id
 
-def get_twit_tags(followers_ids):
+
+def get_twit_tags(twit_tags_semaphore, work_queue, results_queue):
     """ Get a list of tags from a liked post """
-    likes_path = 'https://api.twitter.com/1.1/favorites/list.json'
     tags = []
-    for id in followers_ids:
-        payload = {'user_id' : id, 'count' : 200}
-        request = requests.get(likes_path, params=payload)
-        likes = request.json()
-        # todo: what about pagination?
-        for like in likes:
-            twit_tags = like['entities']['hashtags']
-            tags.extend(twit_tags)
-
-    # collections.Counter(tags)
-    return tags
+    id = get_next(work_queue)
+    with twit_tags_semaphore:
+        try:
+            payload = {'user_id' : id, 'count' : 200}
+            request = requests.get(LIKES_PATH, params=payload)
+            likes = request.json()
+            # todo: what about pagination?
+            for like in likes:
+                twit_tags = like['entities']['hashtags']
+                tags.extend(twit_tags)
+        except: #add rate limit exception returned by the API and recursive call to itself if exception
+            logging.info("Could not retrieve data from Twitter due to rate limit")
+        new_result_entry = Counter(tags)
+        results_queue.put(new_result_entry)
+        return
 
 
 def update_result_dict(result_dict, subresult_dict):
@@ -105,7 +119,7 @@ def main():
     import json
     import time
     import requests
-    from collections import defaultdict
+    from collections import defaultdict, Counter
 
     result_dict = defaultdict(int)
     result_lock = threading.Lock()
@@ -113,9 +127,26 @@ def main():
     work_queue = Queue.Queue()
     results_queue = Queue.Queue()
 
-    threads = []
+    twit_tags_semaphore = threading.BoundedSemaphore(value = TWIT_TAGS_CONNECTIONS)
+    #add followers' ids to the work_queue for further processing by worker threads
+    followers_ids = get_target_subscribers("")
+    for id in followers_ids:
+        work_queue.put(id)
 
-    logging.info("Creating threads")
+    threads = []
+    tag_threads = []
+
+    logging.info("Creating threads to get tags")
+    for _ in range(len(followers_ids)):
+        thread = threading.Thread(target=get_twit_tags, args=(twit_tags_semaphore, work_queue))
+        logging.info("Starting threads to get tags")
+        thread.start()
+        tag_threads.append(thread)
+
+    for thread in tag_threads:
+        thread.join()
+
+    logging.info("Creating threads to merge counters")
     for _ in range(20):
         thread = threading.Thread(target=worker, args=([], result_dict, result_lock))
         logging.info("Starting threads")
